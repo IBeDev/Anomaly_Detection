@@ -1,148 +1,119 @@
-import numpy as np
 import pandas as pd
+import numpy as np
 from datetime import datetime
-from typing import Tuple, Dict, List
 
 class RandomAnomalyDetector:
-    def __init__(self, threshold: float = 0.95):
-        self.threshold = threshold
-        self.model_state = {}
+    def __init__(self):
         self.training_data = None
         self.numeric_columns = None
         self.datetime_columns = None
+        self.means = None
+        self.stds = None
+
+    def train(self, df):
+        """Train the detector with historical data"""
+        self.training_data = df
+        self.numeric_columns = df.select_dtypes(include=['float64', 'int64']).columns
+        self.datetime_columns = pd.Index([col for col in df.columns if pd.api.types.is_datetime64_any_dtype(df[col])])
         
-    def train(self, data: pd.DataFrame) -> None:
-        """Placeholder for model training"""
-        self.training_data = data
-        
-        # Identify numeric and datetime columns
-        self.numeric_columns = data.select_dtypes(include=['float64', 'int64']).columns
-        self.datetime_columns = data.select_dtypes(include=['datetime64']).columns
-        
-        # Store basic statistics for synthetic data generation (numeric columns only)
-        numeric_data = data[self.numeric_columns]
-        self.model_state = {
-            'mean': numeric_data.mean(),
-            'std': numeric_data.std(),
-            'min': numeric_data.min(),
-            'max': numeric_data.max()
-        }
-        
-        # Store datetime range if datetime columns exist
-        if not self.datetime_columns.empty:
-            self.model_state['datetime_range'] = {
-                col: (data[col].min(), data[col].max())
-                for col in self.datetime_columns
-            }
-    
-    def detect_anomalies(self, data: pd.DataFrame) -> Tuple[np.ndarray, float]:
-        """
-        Detect anomalies using random probability
-        Returns:
-            - Boolean array of anomalies
-            - Confidence score
-        """
-        # Random probability for each point
-        rng = np.random.default_rng()
-        probabilities = rng.random(len(data))
-        anomalies = probabilities > self.threshold
-        confidence = np.mean(probabilities[anomalies]) if any(anomalies) else 0
-        
-        return anomalies, confidence
-    
-    def generate_synthetic_data(self, n_samples: int = 100) -> pd.DataFrame:
-        """Generate synthetic data similar to training data"""
+        # Calculate statistics for numeric columns
+        self.means = df[self.numeric_columns].mean()
+        self.stds = df[self.numeric_columns].std()
+
+    def generate_synthetic_data(self, n_points=1):
+        """Generate synthetic data points based on training data distribution"""
         if self.training_data is None:
-            raise ValueError("Model must be trained before generating synthetic data")
+            raise ValueError("Detector must be trained first")
         
-        rng = np.random.default_rng()    
-        synthetic_data = {}
+        synthetic_data = pd.DataFrame()
         
-        # Generate synthetic values for numeric columns
-        for column in self.numeric_columns:
-            mean = self.model_state['mean'][column]
-            std = self.model_state['std'][column]
-            min_val = self.model_state['min'][column]
-            max_val = self.model_state['max'][column]
-            
-            # Generate data within the observed range
-            synthetic_values = rng.normal(mean, std, n_samples)
-            synthetic_values = np.clip(synthetic_values, min_val, max_val)
-            synthetic_data[column] = synthetic_values
+        # Generate data for numeric columns
+        for col in self.numeric_columns:
+            # Add random noise to mean
+            synthetic_data[col] = np.random.normal(
+                loc=self.means[col],
+                scale=self.stds[col],
+                size=n_points
+            )
         
-        # Generate synthetic timestamps for datetime columns
-        for column in self.datetime_columns:
-            min_time, max_time = self.model_state['datetime_range'][column]
-            min_ts = min_time.timestamp()
-            max_ts = max_time.timestamp()
-            
-            # Generate random timestamps within the observed range
-            random_timestamps = rng.uniform(min_ts, max_ts, n_samples)
-            synthetic_data[column] = [pd.Timestamp.fromtimestamp(ts) for ts in random_timestamps]
-            
-        return pd.DataFrame(synthetic_data)
+        # Add timestamp if datetime columns exist
+        for col in self.datetime_columns:
+            synthetic_data[col] = pd.date_range(
+                end=pd.Timestamp.now(),
+                periods=n_points
+            )
+        
+        return synthetic_data
+
+    def detect_anomalies(self, data, threshold=3.0):
+        """
+        Detect anomalies in new data points
+        Returns tuple (is_anomaly, confidence)
+        """
+        if self.training_data is None:
+            raise ValueError("Detector must be trained first")
+        
+        # Calculate z-scores for numeric columns
+        z_scores = np.abs((data[self.numeric_columns] - self.means) / self.stds)
+        
+        # Calculate mean z-score across features
+        mean_z_score = z_scores.mean(axis=1)
+        
+        # Mark as anomaly if mean z-score exceeds threshold
+        is_anomaly = mean_z_score > threshold
+        
+        # Calculate confidence based on how far the z-score is above threshold
+        confidence = np.clip((mean_z_score - threshold) / threshold, 0, 1)
+        
+        return is_anomaly.values, confidence.values[0] if len(confidence) > 0 else 0.0
 
 class AnomalyLogger:
-    def __init__(self, log_file: str = "anomaly_log.csv"):
-        self.log_file = log_file
-        self.log_data = []
-        
-    def log_anomaly(self, timestamp: datetime, features: Dict[str, float], 
-                    is_confirmed: bool = None, confidence: float = None) -> None:
-        """Log detected anomaly with optional confirmation"""
-        log_entry = {
+    def __init__(self):
+        self.logs = []
+
+    def log_anomaly(self, timestamp, features, confidence, is_confirmed=False):
+        """Log an anomaly event"""
+        self.logs.append({
             'timestamp': timestamp,
             'features': features,
-            'is_confirmed': is_confirmed,
-            'confidence': confidence
-        }
-        self.log_data.append(log_entry)
-        # Don't save during initialization to avoid file I/O errors
-        if len(self.log_data) > 3:  # Only save after initial sample data
-            self._save_log()
-    
-    def get_anomalies(self) -> List[Dict]:
-        """Get all logged anomalies"""
-        return self.log_data
-    
-    def _save_log(self) -> None:
-        """Save log entries to CSV file"""
-        df = pd.DataFrame(self.log_data)
-        df.to_csv(self.log_file, index=False)
-    
-    def get_logs(self) -> pd.DataFrame:
-        """Retrieve all logged anomalies"""
-        return pd.DataFrame(self.log_data)
+            'confidence': confidence,
+            'is_confirmed': is_confirmed
+        })
+
+    def get_recent_logs(self, n=10):
+        """Get most recent anomaly logs"""
+        return sorted(self.logs, key=lambda x: x['timestamp'], reverse=True)[:n]
 
 class SystemHealthMonitor:
     def __init__(self):
         self.metrics = []
-        
-    def record_metric(self, timestamp: datetime, cpu_usage: float, 
-                     memory_usage: float, processing_time: float) -> None:
+        self.window_size = 60  # Keep last 60 measurements
+
+    def record_metric(self, timestamp, cpu_usage, memory_usage, processing_time):
         """Record system health metrics"""
-        metric = {
+        self.metrics.append({
             'timestamp': timestamp,
             'cpu_usage': cpu_usage,
             'memory_usage': memory_usage,
             'processing_time': processing_time
-        }
-        self.metrics.append(metric)
-    
-    def get_health_metrics(self) -> pd.DataFrame:
-        """Get all recorded health metrics"""
-        return pd.DataFrame(self.metrics)
-    
-    def get_system_status(self) -> Dict[str, float]:
-        """Get current system status summary"""
-        if not self.metrics:
-            return {}
-            
-        df = pd.DataFrame(self.metrics)
-        recent = df.iloc[-10:]  # Last 10 readings
+        })
         
+        # Keep only recent metrics
+        if len(self.metrics) > self.window_size:
+            self.metrics = self.metrics[-self.window_size:]
+
+    def get_system_status(self):
+        """Get average system metrics"""
+        if not self.metrics:
+            return {
+                'avg_cpu': 0,
+                'avg_memory': 0,
+                'avg_processing_time': 0
+            }
+        
+        recent_metrics = self.metrics[-self.window_size:]
         return {
-            'avg_cpu': recent['cpu_usage'].mean(),
-            'avg_memory': recent['memory_usage'].mean(),
-            'avg_processing_time': recent['processing_time'].mean()
+            'avg_cpu': sum(m['cpu_usage'] for m in recent_metrics) / len(recent_metrics),
+            'avg_memory': sum(m['memory_usage'] for m in recent_metrics) / len(recent_metrics),
+            'avg_processing_time': sum(m['processing_time'] for m in recent_metrics) / len(recent_metrics)
         }
